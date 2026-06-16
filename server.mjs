@@ -342,65 +342,102 @@ server.registerTool(
       "Compute server-side aggregates over matching records: a Count, and an " +
       "optional Sum of a numeric attribute (e.g. sum_field='total_refunded' " +
       "or 'price'). Optionally group_by an attribute (e.g. 'record_type', " +
-      "'source', 'channel') for a breakdown. Use for 'how many refunds', " +
-      "'total refunded in May', 'count of campaigns by channel'. Sum only " +
-      "works on numeric attributes.",
+      "'source', 'channel', 'item_title') for a breakdown. When grouped, " +
+      "results are returned as a leaderboard ranked descending by the Sum " +
+      "(or Count if no sum_field). Use for 'best sellers by units' " +
+      "(record_type='shopify_order_item', sum_field='quantity', " +
+      "group_by='item_title'), 'total refunded in May', 'campaigns by " +
+      "channel'. Sum only works on numeric attributes.",
     inputSchema: {
       sum_field: z
         .string()
         .optional()
-        .describe("Numeric attribute to Sum, e.g. 'total_refunded', 'price'."),
+        .describe("Numeric attribute to Sum, e.g. 'total_refunded', 'price', 'quantity'."),
       group_by: z
         .string()
         .optional()
-        .describe("Attribute to group results by, e.g. 'record_type', 'channel'."),
+        .describe("Attribute to group results by, e.g. 'record_type', 'channel', 'item_title'."),
       max_groups: z
         .number()
         .int()
         .min(1)
         .max(1000)
         .optional()
-        .describe("Max groups to return when group_by is set (default 100)."),
+        .describe("Max groups to fetch when group_by is set (default 100)."),
+      normalize_keys: z
+        .boolean()
+        .optional()
+        .describe(
+          "Merge groups whose key matches case-insensitively (default true), " +
+            "so 'Black and Cream' and 'BLACK AND CREAM' count as one. Set " +
+            "false to keep exact-case groups separate.",
+        ),
       ...filterShape,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ sum_field, group_by, max_groups, ...filterArgs }) => {
+  async ({ sum_field, group_by, max_groups, normalize_keys, ...filterArgs }) => {
     try {
+      const metricKey = sum_field ? `sum_${sum_field}` : "count";
       const aggregate_by = { count: ["Count"] };
-      if (sum_field) aggregate_by[`sum_${sum_field}`] = ["Sum", sum_field];
+      if (sum_field) aggregate_by[metricKey] = ["Sum", sum_field];
 
-      const params = {
-        aggregate_by,
-        top_k: group_by ? max_groups ?? 100 : 1,
-        include_attributes: false,
-      };
+      // NOTE: aggregate queries must NOT send include_attributes, and group_by
+      // must be a SEQUENCE of attribute names, not a bare string.
+      const params = { aggregate_by, top_k: group_by ? max_groups ?? 100 : 1 };
       const filters = buildFilters(filterArgs);
       if (filters) params.filters = filters;
-      if (group_by) params.group_by = group_by;
+      if (group_by) params.group_by = [group_by];
 
       const result = await ns.query(params);
 
-      if (group_by) {
-        const groups = result.aggregation_groups ?? [];
-        if (groups.length === 0) return ok("No matching records.");
-        const text = groups
-          .map((g) => {
-            const parts = Object.entries(g).map(
-              ([k, v]) =>
-                `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-            );
-            return `• ${parts.join(" · ")}`;
-          })
-          .join("\n");
-        return ok(`Grouped by '${group_by}':\n${text}`);
+      // ---- Ungrouped: single aggregate row ----
+      if (!group_by) {
+        const agg = result.aggregations ?? {};
+        const text = Object.entries(agg)
+          .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+          .join(" · ");
+        return ok(text || "No matching records.");
       }
 
-      const agg = result.aggregations ?? {};
-      const text = Object.entries(agg)
-        .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
-        .join(" · ");
-      return ok(text || "No matching records.");
+      // ---- Grouped: normalize → merge → rank into a leaderboard ----
+      let rows = (result.aggregation_groups ?? []).map((g) => {
+        const label =
+          g[group_by] ?? Object.values(g).find((v) => typeof v === "string");
+        const count = Number(g.count ?? 0);
+        const metric = sum_field ? Number(g[metricKey] ?? 0) : count;
+        return { label: label == null ? "(unknown)" : String(label), count, metric };
+      });
+
+      if (rows.length === 0) return ok("No matching records.");
+
+      const merge = normalize_keys !== false; // default ON
+      if (merge) {
+        const byKey = new Map();
+        for (const r of rows) {
+          const key = r.label.trim().toLowerCase();
+          const cur = byKey.get(key);
+          if (cur) {
+            cur.count += r.count;
+            cur.metric += r.metric;
+          } else {
+            byKey.set(key, { ...r }); // keep first-seen original casing as label
+          }
+        }
+        rows = [...byKey.values()];
+      }
+
+      rows.sort((a, b) => b.metric - a.metric);
+
+      const lines = rows.map((r, i) => {
+        const extra = sum_field ? ` · count ${r.count}` : "";
+        return `${i + 1}. ${r.label} — ${metricKey} ${r.metric}${extra}`;
+      });
+      const header =
+        `Ranked by ${metricKey}, group_by '${group_by}'` +
+        (merge ? ", case-merged" : "") +
+        `:`;
+      return ok(`${header}\n${lines.join("\n")}`);
     } catch (err) {
       return fail(
         err,

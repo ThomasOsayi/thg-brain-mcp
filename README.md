@@ -12,7 +12,7 @@ campaigns, flows, profiles), and Gmail.
 | `search_business_records` | Semantic vector search. Embeds the query and matches by meaning. Now also accepts optional `record_type` / `source` / `since` / `until` / `equals` filters. |
 | `list_records` | Exact, filter-only query (no embedding), sorted by an attribute. Use when you know exactly what you want, e.g. "all `shopify_refund` since 2026-04-01". Pass `source:"gmail"` for an email-only view. |
 | `get_records_by_id` | Fetch specific records by exact id, e.g. `shopify:refund:994175385790`. |
-| `aggregate_records` | Server-side `Count` and optional `Sum` of a numeric field (`total_refunded`, `price`, ...), with optional `group_by` (`record_type`, `source`, `channel`, ...). |
+| `aggregate_records` | Server-side `Count` and optional `Sum` of a numeric field (`total_refunded`, `price`, `quantity`, ...), with optional `group_by` (`record_type`, `source`, `channel`, `item_title`, ...). Grouped results come back as a **leaderboard ranked by the Sum** (or Count). By default it **case-merges** duplicate group keys (e.g. "Black and Cream" + "BLACK AND CREAM"); pass `normalize_keys:false` to keep them separate. |
 | `upsert_records` | Embed `content` and write new/updated records into the namespace so they're immediately searchable. |
 | `describe_namespace` | List stored attributes with their types and whether they're filterable. Run this first to discover field names. |
 
