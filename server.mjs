@@ -387,7 +387,7 @@ server.registerTool(
       const params = { aggregate_by, top_k: group_by ? max_groups ?? 100 : 1 };
       const filters = buildFilters(filterArgs);
       if (filters) params.filters = filters;
-      if (group_by) params.group_by = [group_by];
+      if (group_by) params.group_by = Array.isArray(group_by) ? group_by : [group_by];
 
       const result = await ns.query(params);
 
