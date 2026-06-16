@@ -379,8 +379,11 @@ server.registerTool(
   async ({ sum_field, group_by, max_groups, normalize_keys, ...filterArgs }) => {
     try {
       const metricKey = sum_field ? `sum_${sum_field}` : "count";
-      const aggregate_by = { count: ["Count"] };
-      if (sum_field) aggregate_by[metricKey] = ["Sum", sum_field];
+      // Turbopuffer allows exactly one aggregate function per query, so Sum and
+      // Count are mutually exclusive: Sum when a field is given, else Count.
+      const aggregate_by = sum_field
+        ? { [metricKey]: ["Sum", sum_field] }
+        : { count: ["Count"] };
 
       // NOTE: aggregate queries must NOT send include_attributes, and group_by
       // must be a SEQUENCE of attribute names, not a bare string.
