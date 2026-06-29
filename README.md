@@ -15,6 +15,8 @@ campaigns, flows, profiles), and Gmail.
 | `aggregate_records` | Server-side `Count` and optional `Sum` of a numeric field (`total_refunded`, `price`, `quantity`, ...), with optional `group_by` (`record_type`, `source`, `channel`, `item_title`, ...). Grouped results come back as a **leaderboard ranked by the Sum** (or Count). By default it **case-merges** duplicate group keys (e.g. "Black and Cream" + "BLACK AND CREAM"); pass `normalize_keys:false` to keep them separate. |
 | `upsert_records` | Embed `content` and write new/updated records into the namespace so they're immediately searchable. |
 | `describe_namespace` | List stored attributes with their types and whether they're filterable. Run this first to discover field names. |
+| `query_meta_metrics` | Exact Meta spend/revenue/ROAS from Postgres — breakdowns: summary, day, campaign, ad, creator. |
+| `verify_meta_ceiling` | Compare Meta-attributed revenue vs Shopify store revenue for a date window. |
 
 ## Environment variables
 
@@ -25,6 +27,11 @@ campaigns, flows, profiles), and Gmail.
 | `TURBOPUFFER_API_KEY` | yes | — |
 | `TURBOPUFFER_REGION` *or* `TURBOPUFFER_BASE_URL` | one of them | — |
 | `TURBOPUFFER_NAMESPACE` | no | `thg_business_records` |
+| `NEXT_PUBLIC_SUPABASE_URL` | for Meta tools | — |
+| `SUPABASE_SERVICE_ROLE_KEY` | for Meta tools | — |
+
+`query_meta_metrics` and `verify_meta_ceiling` need Supabase env vars plus migration
+`0007_meta_insights.sql` applied in the brain Postgres project.
 
 The embedding model **must** match the model the records were stored with
 (`text-embedding-3-small`, 1536-dim), or semantic search quality degrades.

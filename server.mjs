@@ -12,6 +12,8 @@
 //   4. aggregate_records       — server-side Count / Sum, optional group_by
 //   5. upsert_records          — embed + write new/updated records (ingest)
 //   6. describe_namespace      — inspect the stored schema (fields + types)
+//   7. query_meta_metrics      — exact Meta spend/revenue/ROAS from Postgres
+//   8. verify_meta_ceiling     — Meta revenue vs Shopify store ceiling check
 //
 // Every record carries: id, content, record_type, source, source_created_at,
 // synced_at, plus type-specific attributes (e.g. total_refunded, price,
@@ -25,6 +27,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import OpenAI from "openai";
 import Turbopuffer from "@turbopuffer/turbopuffer";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
 const {
   OPENAI_API_KEY,
@@ -67,6 +70,24 @@ const tpuf = new Turbopuffer({
   logLevel: "error",
 });
 const ns = tpuf.namespace(TURBOPUFFER_NAMESPACE);
+
+const { NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+
+let _sb = null;
+function sb() {
+  if (_sb) return _sb;
+  const url = NEXT_PUBLIC_SUPABASE_URL?.trim().replace(/^["']|["']$/g, "");
+  const key = SUPABASE_SERVICE_ROLE_KEY?.trim().replace(/^["']|["']$/g, "");
+  if (!url || !key) {
+    throw new Error(
+      "Supabase env not set (NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)",
+    );
+  }
+  _sb = createSupabaseClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  return _sb;
+}
 
 // Canonical per-record event timestamp present on every source. Stored as an
 // ISO-8601 string, so lexicographic Gte/Lte comparisons sort chronologically.
@@ -559,6 +580,174 @@ server.registerTool(
   },
 );
 
+// ----------------------------------------------------------------------------
+// 7. Meta metrics — exact spend/revenue/ROAS from Postgres
+// ----------------------------------------------------------------------------
+server.registerTool(
+  "query_meta_metrics",
+  {
+    title: "Query Meta Ads metrics (exact spend / revenue / ROAS)",
+    description:
+      "Authoritative Meta Ads numbers from Postgres — exact SUM/GROUP BY, not " +
+      "semantic estimates. Use for ANY question about ad spend, ad revenue, " +
+      "ROAS, purchases, or per-day / per-campaign / per-ad / per-creator " +
+      "breakdowns. Choose a breakdown: 'summary', 'day', 'campaign', 'ad', " +
+      "or 'creator'. Optional inclusive date bounds since/until (YYYY-MM-DD).",
+    inputSchema: {
+      breakdown: z
+        .enum(["summary", "day", "campaign", "ad", "creator"])
+        .describe("Which view to return."),
+      since: z.string().optional().describe("Inclusive start date YYYY-MM-DD."),
+      until: z.string().optional().describe("Inclusive end date YYYY-MM-DD."),
+      max_rows: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .optional()
+        .describe("Max groups for campaign/ad/creator (default 100)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ breakdown, since, until, max_rows }) => {
+    try {
+      const sinceArg = since ?? null;
+      const untilArg = until ?? null;
+      const rows = max_rows ?? 100;
+      const map = {
+        summary: ["meta_spend_summary", { since: sinceArg, until: untilArg }],
+        day: ["meta_spend_by_day", { since: sinceArg, until: untilArg }],
+        campaign: [
+          "meta_spend_by_campaign",
+          { since: sinceArg, until: untilArg, max_rows: rows },
+        ],
+        ad: ["meta_spend_by_ad", { since: sinceArg, until: untilArg, max_rows: rows }],
+        creator: [
+          "meta_spend_by_creator",
+          { since: sinceArg, until: untilArg, max_rows: rows },
+        ],
+      };
+      const [rpc, args] = map[breakdown];
+      const { data, error } = await sb().rpc(rpc, args);
+      if (error) {
+        return fail(error, `RPC ${rpc} failed — check 0007_meta_insights.sql is applied.`);
+      }
+      const range =
+        sinceArg || untilArg
+          ? ` (${sinceArg ?? "open"} → ${untilArg ?? "open"})`
+          : " (all loaded data)";
+      return ok(`Meta ${breakdown}${range}:\n${JSON.stringify(data, null, 2)}`);
+    } catch (err) {
+      return fail(err, "Needs Supabase env + 0007_meta_insights.sql applied.");
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+// 8. Verify Meta revenue against the Shopify store ceiling
+// ----------------------------------------------------------------------------
+server.registerTool(
+  "verify_meta_ceiling",
+  {
+    title: "Verify Meta revenue vs Shopify store ceiling",
+    description:
+      "Sanity-check Meta-attributed revenue against ACTUAL Shopify store " +
+      "revenue for the same window. Meta revenue (from Postgres, the " +
+      "corrected single-value parse) is compared to the store's total order " +
+      "revenue (from the brain). Returns the ratio and a verdict. A ratio " +
+      "near or below ~1.3x is NORMAL cross-channel over-attribution; a high " +
+      "ratio (>=2x) means Meta revenue is inflated — the classic " +
+      "purchase-action summing bug resurfacing. Use to validate a backfill " +
+      "or spot-check any week/month. Provide inclusive since/until (YYYY-MM-DD).",
+    inputSchema: {
+      since: z.string().describe("Inclusive start date YYYY-MM-DD."),
+      until: z.string().describe("Inclusive end date YYYY-MM-DD."),
+      warn_ratio: z
+        .number()
+        .optional()
+        .describe("Ratio at/above which to warn (default 2.0)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ since, until, warn_ratio }) => {
+    try {
+      const { data: metaData, error: metaErr } = await sb().rpc("meta_spend_summary", {
+        since,
+        until,
+      });
+      if (metaErr) {
+        return fail(
+          metaErr,
+          "Ceiling check failed reading Meta (meta_spend_summary). " +
+            "Check 0007_meta_insights.sql and SUPABASE_SERVICE_ROLE_KEY.",
+        );
+      }
+      const meta = Array.isArray(metaData) ? metaData[0] : metaData;
+      const metaRevenue = Number(meta?.revenue ?? 0);
+      const metaSpend = Number(meta?.spend ?? 0);
+      const metaRoas = Number(meta?.roas ?? 0);
+
+      const storeAgg = await ns.query({
+        aggregate_by: { sum_total_price: ["Sum", "total_price"] },
+        group_by: ["record_type"],
+        filters: [
+          "And",
+          [
+            ["record_type", "Eq", "shopify_order"],
+            [DATE_FIELD, "Gte", since],
+            [DATE_FIELD, "Lte", until],
+          ],
+        ],
+        top_k: 1,
+      });
+      const storeGroup = (storeAgg?.aggregation_groups ?? [])[0];
+      const storeRevenue = Number(storeGroup?.sum_total_price ?? 0);
+
+      const threshold = warn_ratio ?? 2.0;
+      const ratio = storeRevenue > 0 ? metaRevenue / storeRevenue : null;
+
+      let verdict;
+      if (storeRevenue <= 0) {
+        verdict =
+          "⚠️ NO STORE REVENUE for this window — can't form a ceiling. " +
+          "Check the date range or whether Shopify orders are loaded for it.";
+      } else if (ratio === null) {
+        verdict = "⚠️ Could not compute ratio.";
+      } else if (ratio >= threshold) {
+        verdict =
+          `🚨 INFLATED — Meta revenue is ${ratio.toFixed(2)}x the store's total. ` +
+          `That exceeds the ${threshold}x alarm line; the purchase-action ` +
+          `summing bug is likely back. Investigate the parse.`;
+      } else if (ratio >= 1.3) {
+        verdict =
+          `✅ PLAUSIBLE — Meta is ${ratio.toFixed(2)}x the store. Above 1.0x but ` +
+          `within normal cross-channel over-attribution (Meta double-claims ` +
+          `sales also credited to email/TikTok/organic).`;
+      } else {
+        verdict =
+          `✅ HEALTHY — Meta is ${ratio.toFixed(2)}x the store, a clean fraction ` +
+          `of total revenue. No sign of inflation.`;
+      }
+
+      const text =
+        `Meta ceiling check (${since} → ${until}):\n` +
+        `  Shopify store revenue : $${storeRevenue.toLocaleString()}\n` +
+        `  Meta-attributed rev   : $${metaRevenue.toLocaleString()}\n` +
+        `  Meta spend            : $${metaSpend.toLocaleString()}\n` +
+        `  Meta ROAS (rev/spend) : ${metaRoas.toFixed(2)}x\n` +
+        `  Ratio (Meta / store)  : ${ratio === null ? "n/a" : ratio.toFixed(2) + "x"}\n` +
+        `\n${verdict}`;
+
+      return ok(text);
+    } catch (err) {
+      return fail(
+        err,
+        "Needs Postgres (meta_spend_summary) AND Turbopuffer (shopify_order totals).",
+      );
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[thg-brain] MCP server v2 connected over stdio (6 tools).");
+console.error("[thg-brain] MCP server v2 connected over stdio (8 tools).");
